@@ -31,12 +31,14 @@ import numpy as np
 import pandas as pd
 import SimpleITK as sitk
 from statistics import mode
-
+from joblib import Parallel, delayed
 import visualize_volumes
 #dicom_numpy code is from https://github.com/innolitics/dicom-numpy/blob/master/dicom_numpy/combine_slices.py
 #downloaded on September 19, 2019
 #see dicom_numpy/LICENSE.txt for the dicom_numpy license 
-from dicom_numpy import combine_slices
+from dicom_numpy_local import combine_slices
+import torch
+from torchvision import transforms
 
 class CleanCTScans(object):
     def __init__(self, mode, old_log_file_path, identifiers_path, results_path,
@@ -81,13 +83,15 @@ class CleanCTScans(object):
         #Locations of CT scans
         self.dirty_path = dirty_path
         self.clean_path = clean_path
+        if not os.path.isdir(clean_path):
+            os.mkdir(clean_path)
         
         #Set up input and output paths and necessary filenames
         self.set_up_identifiers()
         self.set_up_logdf()
         
         #Run
-        self.clean_all_pace_data() 
+        self.clean_all_pace_data()
            
     #############
     # PACE Data #---------------------------------------------------------------
@@ -98,16 +102,19 @@ class CleanCTScans(object):
         filenames."""
         #Read in identifiers file
         #identifiers file includes: ['MRN','Accession','Set_Assigned']
-        ids_file = os.path.join(self.identifiers_path,'all_identifiers.csv')
-        self.ids_df = pd.read_csv(ids_file, header=0, index_col = 'Accession')
+        ids_file = os.path.join(self.identifiers_path, 'all_identifiers.csv')
+        self.ids_df = pd.read_csv(ids_file, header=0, index_col='Accession')
         self.note_accessions = self.ids_df.index.values.tolist() #e.g. AA12345
+        self.assigned_set = self.ids_df['Set_Assigned'].values.tolist()
         
         if self.mode == 'testing':
             #Option 1: run on 10 random volumes:
             #self.note_accessions = self.note_accessions[0:10]
             #Option 2: run on pre-specified volumes:
             self.note_accessions = [x[0] for x in pd.read_csv(os.path.join(self.identifiers_path,'testing_ids.csv'),header=0).values.tolist()]
-        
+
+        print(self.note_accessions)
+
         #The actual filenames of the downloaded volumes may be prefixed with
         #additional letters besides AA, will have an underscore followed by
         #a number at the end, and will have the .pkl file extension at the end.
@@ -155,41 +162,64 @@ class CleanCTScans(object):
     def clean_all_pace_data(self):
         """Clean each image and save it as a .npz compressed array. Save a log
         file documenting the cleaning process and metadata."""
+        results = Parallel(n_jobs=len(self.note_accessions))(
+            delayed(self.clean_parallely)(count+1, note_acc) for count, note_acc in enumerate(self.note_accessions))
+
+    def clean_parallely(self, count, note_acc):
         t0 = timeit.default_timer()
-        count = 0
-        for note_acc in self.note_accessions:
-            if self.mode=='testing': print('Working on',note_acc)
-            #note_acc is e.g. AA12345. full_filename_pkl is e.g. RHAA12345_3.pkl
-            #full_filename_pkl is the full filename of the raw dirty CT.
-            #full_filename_pkl will be 'fail' if not found.
-            full_filename_pkl = self.find_full_filename_pkl(note_acc)
-            self.logdf.at[note_acc,'full_filename_pkl'] = full_filename_pkl
-            
-            if full_filename_pkl == 'fail':
-                self.logdf.at[note_acc,'status'] = 'fail'
-                self.logdf.at[note_acc,'status_reason'] = 'volume_not_found'
-                print('\tFailed on',note_acc,'because volume was not found')
-            
-            if full_filename_pkl != 'fail':
-                try:
-                    #Clean
-                    ctvol = self.process_ctvol(full_filename_pkl, note_acc)
-                    #Save
-                    full_filename_npz = full_filename_pkl.replace('.pkl','.npz') #e.g. RHAA12345_3.npz
-                    self.logdf.at[note_acc,'full_filename_npz'] = full_filename_npz
+        if self.mode == 'testing': print('Working on', note_acc)
+        # note_acc is e.g. AA12345. full_filename_pkl is e.g. RHAA12345_3.pkl
+        # full_filename_pkl is the full filename of the raw dirty CT.
+        # full_filename_pkl will be 'fail' if not found.
+        full_filename_pkl = self.find_full_filename_pkl(note_acc)
+        self.logdf.at[note_acc, 'full_filename_pkl'] = full_filename_pkl
+
+        if full_filename_pkl == 'fail':
+            self.logdf.at[note_acc, 'status'] = 'fail'
+            self.logdf.at[note_acc, 'status_reason'] = 'volume_not_found'
+            print('\tFailed on', note_acc, 'because volume was not found')
+
+        if full_filename_pkl != 'fail':
+            try:
+                # Clean
+                ctvol = self.process_ctvol(full_filename_pkl, note_acc)
+                # Save
+                full_filename_npz = full_filename_pkl.replace('.pkl', '.npz')  # e.g. RHAA12345_3.npz
+                self.logdf.at[note_acc, 'full_filename_npz'] = full_filename_npz
+                if self.mode == "run":
+                    assigned_set_dir = os.path.join(self.clean_path, self.assigned_set[count-1])
+                    if not os.path.isdir(assigned_set_dir):
+                        os.mkdir(assigned_set_dir)
+                    out_filename_path = os.path.join(assigned_set_dir, full_filename_npz)
+                else:
                     out_filename_path = os.path.join(self.clean_path, full_filename_npz)
-                    #Save using lossless compression (zip algorithm) so that there
-                    #will be enough space in local storage to fit the entire dataset
-                    np.savez_compressed(out_filename_path,ct=ctvol)
-                    self.logdf.at[note_acc,'status'] = 'success'
-                    self.report_unequal_zdiffs(note_acc, ctvol)
-                except Exception as e:
-                    self.logdf.at[note_acc,'status'] = 'fail'
-                    self.logdf.at[note_acc,'status_reason'] = str(e)
-                    print('\tFailed on',note_acc,'due to',str(e))
-            count+=1
-            if count % 20 == 0: self.report_progress_and_save_logfile(count,t0,note_acc)
-    
+                # Save using lossless compression (zip algorithm) so that there
+                # will be enough space in local storage to fit the entire dataset
+
+                np.savez_compressed(out_filename_path, ct=ctvol)
+                self.logdf.at[note_acc, 'status'] = 'success'
+                self.report_unequal_zdiffs(note_acc, ctvol)
+            except Exception as e:
+                self.logdf.at[note_acc, 'status'] = 'fail'
+                self.logdf.at[note_acc, 'status_reason'] = str(e)
+                print('\tFailed on', note_acc, 'due to', str(e))
+
+        # self.report_progress_and_save_logfile(count, t0, note_acc)
+        print(f'Completed processing {note_acc}')
+
+    @staticmethod
+    def resize_scans(ctvol):
+        """
+        Resize the 3D scans to shape(128, 256, 256)
+        :param ctvol:
+        :return:
+        """
+        resize = transforms.Resize((256, 256))
+        t = torch.from_numpy(ctvol)
+        t = resize(t)
+        resized_tensor = t[int(t.shape[0] / 2) - 64: int(t.shape[0] / 2) + 64]
+        return resized_tensor
+
     def report_unequal_zdiffs(self, note_acc, ctvol):
         """Check whether the zdiffs are equal for the whole scan or not. If not,
         print a warning message and make gifs for that final volume to enable
@@ -220,9 +250,10 @@ class CleanCTScans(object):
         multiple possible full_filename_pkls including AA123456 and AA12345678.
         Therefore I have to split the full_filename_pkl and ensure an exact
         match with the first part of the name."""
+
         for full_filename_pkl in self.volume_accessions:
-            full_filename_pkl_extract = full_filename_pkl.split('_')[0].replace('RH','').replace('B','') #e.g. RHAA1234_6.pkl --> AA1234
-            if note_acc == full_filename_pkl_extract:
+            full_filename_pkl_extract = full_filename_pkl.split('.')[0] #e.g. RHAA1234_6.pkl --> AA1234
+            if str(note_acc) == str(full_filename_pkl_extract):
                 return full_filename_pkl
         return 'fail'
     
@@ -259,6 +290,8 @@ class CleanCTScans(object):
         if self.mode == 'testing': self.visualize(ctvol,note_acc,'_final')
         
         #Return the final volume. ctvol is a 3D numpy array with float16 elements
+        ctvol = CleanCTScans.resize_scans(ctvol)
+        print('Resized the scan to (128, 256, 256)')
         return ctvol
     
     ##################
@@ -290,7 +323,7 @@ class CleanCTScans(object):
             gathered_slopes.append(scl_slope)
             scl_inter = oneslice.data_element('RescaleIntercept').value #example: "-1024"
             gathered_inters.append(scl_inter)
-            assert oneslice.data_element('RescaleType').value == 'HU', 'Error: RescaleType not equal to HU'
+            # assert oneslice.data_element('RescaleType').value == 'HU', 'Error: RescaleType not equal to HU'
             
             #Gather the spacing: example: ['0.585938', '0.585938']; what we save is 0.585938
             #for DICOM, first vlaue is row spacing (vertical spacing) and
@@ -328,7 +361,7 @@ class CleanCTScans(object):
         logdf.at[note_acc,'orig_gantry_tilt'] = gtilt
         
         return logdf
-    
+
     @staticmethod
     def create_volume(raw, note_acc, logdf):
         """Concatenate the slices in the correct order and return a 3D numpy
@@ -454,7 +487,7 @@ class CleanCTScans(object):
         logdf.at[note_acc,'final_numslices'] = final_result.shape[2]
         logdf.at[note_acc,'final_spacing']=0.8
         return final_result, logdf
-    
+
     @staticmethod
     def represent_volume_efficiently_and_transpose(ctvol):
         """Clip the Hounsfield units and cast from float32 to int16 to
@@ -491,7 +524,7 @@ class CleanCTScans(object):
     #################
     def visualize(self, ctvol, note_acc, descriptor):
         """Visualize a CT volume"""
-        outprefix = os.path.join(self.logdir,note_acc+descriptor)
+        outprefix = os.path.join(self.logdir,f'{note_acc}{descriptor}')
         
         visualize_volumes.plot_hu_histogram(ctvol, outprefix)
         print('finished plotting histogram')
@@ -503,7 +536,7 @@ class CleanCTScans(object):
         gifpath = os.path.join(self.logdir,'gifs')
         if not os.path.exists(gifpath):
             os.mkdir(gifpath)
-        visualize_volumes.make_gifs(ctvol,os.path.join(gifpath,note_acc+descriptor),chosen_views=['axial','coronal','sagittal'])
+        visualize_volumes.make_gifs(ctvol,os.path.join(gifpath,f'{note_acc}{descriptor}'),chosen_views=['axial','coronal','sagittal'])
         print('finished making gifs')
         
         np.save(outprefix+'.npy',ctvol)
